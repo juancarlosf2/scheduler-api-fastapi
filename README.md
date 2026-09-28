@@ -14,11 +14,15 @@ cp .env.example .env
 uvicorn app.main:app --reload --env-file .env
 ```
 
-The default database is a local SQLite file for exploration. Set `DATABASE_URL` to a PostgreSQL connection URL for a shared deployment. The starter creates its tables on startup; use a managed migration workflow before deploying schema changes to an existing installation.
+The default database is a local SQLite file for exploration. Set `DATABASE_URL` to a PostgreSQL connection URL for a shared deployment. The starter creates its tables on the first database-backed request; use a managed migration workflow before deploying schema changes to an existing installation.
 
 Run tests with `python -m pytest -q`.
 
 The API needs no provider account for local bookings. Optional provider adapter packages are installed with `python -m pip install -e '.[providers]'`.
+
+## Neon Postgres
+
+Set `DATABASE_URL` to the pooled connection string from Neon. The app accepts Neon's copied `postgresql://` URL and uses its included psycopg 3 driver. Keep the URL in `.env` or a deployment secret store, never in Git. See [the Neon setup guide](docs/NEON.md) for the connection example, TLS option, and migration limits.
 
 ## Authentication modes
 
