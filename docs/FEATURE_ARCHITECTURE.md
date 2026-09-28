@@ -1,128 +1,106 @@
-# Feature based architecture
+# Feature-based FastAPI architecture
 
-This is the proposed module layout for the standalone FastAPI scheduler. It describes how to evolve the current compact implementation without changing its HTTP contract in one large rewrite. The existing files have **not** been moved by this document.
+This document describes the implemented package layout and how to extend it.
+The HTTP contract remains stable while Python modules are organized by feature.
 
-## Target layout
+## Package map
 
 ```text
 app/
-  main.py                         # Create app, install exception handlers, include routers
+  main.py                         # FastAPI app, health, errors, router composition
   core/
-    config.py                     # Validated environment settings
-    database.py                   # Engine, sessions, transaction helpers
-    errors.py                     # Domain errors and HTTP translation
-    auth.py                       # Verified identity and current-host dependency
+    auth.py, dependencies.py      # Auth mode and verified current-host dependency
+    database.py, model.py         # Engine/session and shared SQLAlchemy registry
+    errors.py, http.py            # Domain errors, service wiring, safe projection
+    timezones.py                  # IANA timezone validation
   features/
-    hosts/
-      api.py                      # Host registration and own-host endpoints
-      models.py                   # Host record and identity mapping
-      schemas.py
-      service.py
-    profiles/
-      api.py                      # Profile settings
-      models.py                   # Optional host preferences
-      schemas.py
-      service.py
-    availability/
-      api.py                      # Default schedule management
-      models.py                   # Schedule and intervals
-      schemas.py
-      slots.py                    # Pure timezone-aware slot generation
-      service.py
-    event_types/
-      api.py                      # Host CRUD and publication
-      models.py                   # Event type and invitee fields
-      schemas.py
-      service.py
-    bookings/
-      public_api.py               # Public profile/event/slots/book/actions
-      host_api.py                 # Host meeting list, export, cancel, retry
-      models.py                   # Booking and answers
-      schemas.py
-      service.py                  # Reservation and lifecycle transaction boundary
-      tokens.py                   # Action-token creation and verification
-    calendars/
-      api.py                      # Connect, sync, preferences
-      models.py                   # Connection and external calendars
-      service.py
-      ports.py                    # Calendar provider protocol
-      providers/composio.py       # Optional Composio implementation
-    contacts/
-      api.py
-      models.py
-      service.py
-    onboarding/
-      api.py
-      models.py
-      service.py
-    workflows/
-      api.py
-      models.py
-      service.py
-    notifications/
-      api.py                      # Webhook and delivery administration
-      models.py                   # Outbox, attempts, webhook deduplication
-      service.py
-      ports.py                    # Email provider protocol
-      providers/resend.py         # Optional Resend implementation
-  infrastructure/
-    migrations/                   # Alembic migrations once introduced
-tests/
-  features/                       # HTTP and service tests grouped by feature
-  integration/                    # Cross-feature booking and database tests
+    hosts/                        # Host registration and identity record
+    profiles/                     # Public profile and host settings
+    availability/                 # Schedule, intervals, pure slot generator
+    event_types/                  # Event drafts and publication
+    bookings/                     # Public booking, host meetings, lifecycle
+    calendars/                    # Connection settings, lifecycle, Composio adapter
+    contacts/                     # Contact queries and notes
+    onboarding/                   # Setup and guide state
+    workflows/                    # Stored workflow definitions and listing
+    notifications/                # Email outbox, retry, webhook, Resend adapter
+  workos_auth.py                  # WorkOS AuthKit session flow
+  auth.py, models.py, schemas.py,
+  service.py, ...                 # Compatibility exports for old flat imports
+tests/                             # HTTP, domain, auth, provider, concurrency tests
 ```
 
-Each feature owns its routes, schemas, persistence model, and business rules. Add a file only when that feature needs it; a pure calculation such as `availability/slots.py` does not need a repository class. `main.py` should remain small and only compose routers and dependencies.
+Within a feature, `api.py` and `workspace_api.py` own routes; `schemas.py` and
+`workspace_schemas.py` own Pydantic contracts; `models.py` owns tables; and
+`service.py` or `operations.py` owns decisions. The composed
+`bookings/service.py::SchedulerService` keeps one booking transaction boundary
+while feature mixins own individual operations. `availability/slots.py` is a
+pure calculation. `calendars/ports.py` and `notifications/ports.py` define
+provider methods; their `providers/` directories contain optional SDK
+implementations. Add a file only when the feature needs it.
 
 ## Dependency direction
 
 ```mermaid
 flowchart LR
-    API[Feature API] --> Service[Feature service]
-    Service --> Model[Feature models and queries]
-    Service --> Port[Provider protocol]
-    Adapter[External adapter] -. implements .-> Port
-    Model --> DB[Core database session]
+    Main[app/main.py] --> API[Feature API]
+    API --> Service[Feature service]
+    Service --> Model[Feature models]
+    Service --> Port[Provider port]
+    Adapter[Provider adapter] -. implements .-> Port
+    Model --> Registry[Core SQLAlchemy registry]
 ```
 
-Feature APIs can call their own services. Cross-feature rules belong in the use case that owns the outcome: booking creation belongs in `bookings/service.py`, which reads event type and availability data and asks calendar and notification ports for external effects. Calendar and notification modules should never import booking HTTP routes. Keep provider SDK imports inside adapters so local booking and tests run without provider credentials.
+Routes obtain the current host from `app/core/dependencies.py` and pass its ID
+to services. A feature may read another feature's model for a business rule,
+but should not import another feature's HTTP routes. Booking creation owns
+cross-feature reservation rules. Provider modules do not own transactions.
+The flat `app/*.py` exports exist for compatibility; new code imports its owner
+module directly.
 
-## Booking transaction
+## Add or change a feature
 
-1. Resolve a published event and generate candidate slots in its schedule timezone.
-2. Read local and connected-calendar busy intervals, then reject an unavailable requested slot.
-3. Acquire the host reservation lock and repeat the slot check inside the transaction.
-4. Save the booking, answers, and any durable outbox records together; commit once.
-5. Perform external calendar/email work after the local commit. Persist sync and delivery results, and retry failures with stable idempotency keys.
+1. Put the table in that feature's `models.py` and use
+   `app.core.model.Base`. Register a new model module in
+   `app/core/database.py::create_schema`; add a migration before deploying a
+   schema change to an existing database.
+2. Add request and response models to the feature's schemas. Keep validation
+   and domain errors explicit. Never serialize API key hashes, action token
+   hashes, provider secrets, or WorkOS IDs into public responses.
+3. Put decisions and host-scoped queries in the feature service. Derive host
+   ownership from `get_current_host` at the route boundary. Public routes
+   resolve only active, public event types or verify action tokens.
+4. Add an `APIRouter` in the feature package and include it in `app/main.py`.
+   Preserve an existing path and status when reorganizing code.
+5. Add a focused HTTP or service test. Run `python -m pytest -q` and
+   `ruff check app`. For a refactor, compare generated OpenAPI JSON before
+   and after.
 
-The API must derive host ownership from a verified identity, never a supplied host ID. Public action tokens are distinct by action, stored only as hashes, and rotated when appropriate. Booking instants stay in UTC; schedule rules stay in an IANA timezone.
+For a new calendar or email provider, implement the relevant port and inject
+it at the route/service boundary. Test success, safe failure, and recovery
+without live credentials. Preserve the rules for ambiguous calendar creates
+and stable email idempotency keys.
 
-## Auth boundary
+## Booking and security invariants
 
-The identity module maps a verified WorkOS user or a local development credential to exactly one host record. Routes depend on `current_host`; feature services receive that host ID explicitly. A WorkOS session implementation should own login, callback, refresh, and logout. Business features should not parse cookies or bearer tokens.
+- Booking instants are UTC. Weekly and date-specific availability use local
+  wall-clock minutes in an IANA timezone; date overrides replace weekly rules.
+- Recheck the slot while holding the host reservation lock. Preserve the
+  cross-event overlap and scheduled event/start uniqueness protections.
+- Commit the local booking and durable notification intent before external
+  calls. An external failure must not silently remove a valid reservation.
+- Keep cancel and reschedule tokens distinct, hashed at rest, and rotated on
+  reschedule. Never log raw action tokens or stored hashes.
+- Scope protected reads and writes to the verified host, including contacts,
+  calendar settings, delivery retries, and reconciliation.
+- Preserve each booking's calendar destination ID. Do not automatically retry
+  an ambiguous calendar create until its outcome has been reconciled.
 
-## Migration from the current files
+## Compatibility and current limits
 
-Move one feature at a time and keep the same path, method, request schema, response schema, and error status while doing so. A practical order is:
-
-1. Extract `core/database.py`, `core/errors.py`, and identity dependencies. Keep `app/main.py` as a compatibility facade.
-2. Move the pure availability function and its tests.
-3. Move event types and booking service methods, preserving the reservation concurrency test.
-4. Move calendar and notification adapters behind protocols.
-5. Move profile, meetings, contacts, onboarding, and workflow endpoints.
-6. Replace automatic table creation with Alembic migrations and check the generated OpenAPI diff.
-
-At each step, run the existing HTTP tests plus the affected feature tests. Do not change the URL layout merely because the Python module layout changes. Update the root architecture guide when this target becomes the actual implementation.
-
-## Current-to-target map
-
-| Current module | Intended owner |
-| --- | --- |
-| `app/auth.py`, `app/dependencies.py` | `core/auth.py` and `features/hosts/` |
-| `app/availability.py` | `features/availability/slots.py` |
-| `app/service.py` | `features/event_types/service.py` and `features/bookings/service.py` |
-| `app/calendar.py`, `app/calendar_routes.py`, `app/integrations/calendar.py` | `features/calendars/` |
-| `app/workspace.py`, `app/workspace_routes.py` | Profiles, bookings, contacts, onboarding, and workflows |
-| `app/integrations/email.py` | `features/notifications/providers/resend.py` |
-| `app/models.py`, `app/schemas.py` | Feature-owned models and schemas |
-| `app/storage.py` | `core/database.py` |
+The old flat import paths are re-exports for existing clients and tests. They
+are intentionally thin and should not acquire new business logic. WorkOS
+session handling remains in `app/workos_auth.py` because auth is shared by all
+features. The starter uses `create_all` for first-run setup; production schema
+changes need Alembic migrations. Real WorkOS, Composio, and Resend tenants
+still need provider-backed verification before deployment.

@@ -1,39 +1,84 @@
 # Architecture and extension points
 
-This repository is a compact starting point for a scheduling backend. The layers are intentionally small:
+This repository is a feature-based FastAPI scheduling backend. A feature owns
+its routes, validation, persistence tables, and business rules. Shared
+infrastructure lives in `app/core/`; `app/main.py` composes the application.
 
 ```text
 HTTP request
-  -> app/main.py or app/workspace_routes.py (validation and response contract)
-  -> app/service.py (booking decisions)
-  -> app/availability.py (pure slot calculation)
-  -> app/models.py and app/storage.py (persistence)
-  -> app/integrations/ (optional provider adapters)
+  -> app/main.py (router composition and error translation)
+  -> app/features/<feature>/api.py or workspace_api.py (HTTP contract)
+  -> app/features/<feature>/service.py (business decisions)
+  -> app/features/<feature>/models.py (SQLAlchemy tables)
+  -> app/features/<feature>/providers/ (optional external effects)
 ```
 
-## Domain boundaries
+The package map and extension steps are in
+[docs/FEATURE_ARCHITECTURE.md](docs/FEATURE_ARCHITECTURE.md).
 
-- A host owns a default availability schedule, event types, bookings, and contacts. Protected endpoints resolve the host from a verified WorkOS session or local development key; callers cannot supply another host ID to cross that boundary.
-- A public profile exposes active event types only. A public booking always rechecks a generated slot in a database transaction before it saves.
-- Invitee cancel and reschedule links carry different random tokens. Only token hashes are stored. Rescheduling rotates both tokens.
-- UTC instants are stored for bookings. Availability intervals use local wall-clock minutes in an IANA timezone. Date-specific intervals override weekly intervals for that date.
+## Feature boundaries
 
-## Replace the starter auth
+- `hosts` owns local registration and the host record. WorkOS AuthKit login
+  remains in `app/workos_auth.py`; `app/core/dependencies.py` resolves a
+  verified session or local development key to one host.
+- `profiles` owns public profile lookup and authenticated profile settings.
+- `availability` owns schedules, interval validation, and pure slot generation.
+- `event_types` owns drafts, publication, and host event configuration.
+- `bookings` owns public actions, host meetings, reservation locking, token
+  rotation, and the composed `SchedulerService` transaction boundary.
+- `calendars` owns account settings and the optional Composio adapter.
+- `contacts`, `onboarding`, and `workflows` own their host workspace state.
+- `notifications` owns the email outbox, retry worker, signed webhook, and
+  optional Resend adapter.
 
-The deployed path uses WorkOS AuthKit. The login callback verifies the OAuth state and binds a local host to the WorkOS user ID. Host routes authenticate the sealed session and derive the host from that ID. Local mode issues a one-time bearer key for development without provider credentials. Preserve the rule that ownership comes from a verified principal, never a request-supplied host ID.
+The old flat modules such as `app/service.py`, `app/models.py`, and
+`app/availability.py` export the same objects for existing users. New code
+should import feature modules directly. All tables share the `Base` registry
+in `app/core/model.py`.
 
-## Add a calendar provider
+## Booking transaction
 
-`SchedulerService` reads host-scoped calendar settings and uses the optional Composio adapter to add external busy intervals and create, patch, or delete events. It records the intended provider operation before the call so a provider failure does not erase the local reservation. An interrupted create can have an unknown provider outcome; a found event ID can be reconciled through the host endpoint, while confirming absence for an `inflight` attempt requires operators to quiesce workers and repair state first. Google Meet publication requires an active connection and destination calendar. The adapter is inactive without provider credentials; live provider behavior still needs an end-to-end check.
+Public booking resolves an active event and generates slots in its schedule's
+IANA timezone, including local and connected-calendar busy times. It acquires
+a host reservation lock and rechecks the slot in the transaction. The local
+booking, answers, and durable notification rows commit before provider calls.
+A provider failure does not erase the local booking.
 
-## Add notifications
+Cancel and reschedule actions use different random tokens. Only hashes are
+stored; rescheduling rotates both tokens. Booking instants are UTC, while
+availability intervals use local wall-clock minutes. Date-specific intervals
+replace weekly intervals for that date. Protected queries derive ownership
+from the authenticated host, never a request-supplied host ID.
 
-Booking persistence and provider calls are separate phases. The booking transaction stores email delivery rows with stable occurrence keys. The API attempts delivery after commit, and `python -m app.notifications` processes due rows when run by an operator or scheduler. Host routes expose delivery status and retry. The optional Resend adapter sends rendered snapshots; signed webhooks update state with event deduplication. Production operators must schedule the recovery command and monitor failures.
+## Replace a provider
+
+`app/features/calendars/ports.py` defines the calendar operations used by
+settings and booking lifecycle code. The Composio implementation is in
+`app/features/calendars/providers/composio.py`. Inject an implementation into
+`SchedulerService(calendar_adapter=...)` and the calendar route dependency.
+Keep SDK imports inside adapters. Preserve the recorded calendar destination
+ID, and reconcile an unknown calendar-create outcome before retrying.
+
+`app/features/notifications/ports.py` defines email sending and webhook
+verification. The Resend implementation is in
+`app/features/notifications/providers/resend.py`. Booking enqueues delivery
+rows in its transaction. The API attempts delivery after commit, and
+`python -m app.notifications` processes due rows on an operator-managed
+schedule. Tests can inject fake transports without provider credentials.
 
 ## Database lifecycle
 
-The starter defaults to SQLite and supports SQLAlchemy PostgreSQL URLs. Table creation at startup is for first-run exploration and does not alter existing tables. Adopt Alembic migrations before production schema changes. For concurrent bookings, keep a host-scoped transaction lock or an equivalent database-enforced exclusion rule and retain the unique scheduled event/start constraint. Run the reservation concurrency test against the production database engine before launch.
+`app/core/database.py` creates the engine and session factory. SQLite is the
+default for local exploration; PostgreSQL is supported through `DATABASE_URL`.
+Feature models are registered before `create_all` runs. First-run table
+creation does not migrate existing schemas. Add Alembic migrations before a
+production schema change. Keep the host-scoped reservation lock or an
+equivalent database-enforced exclusion rule, and run the concurrency test
+against the intended production database engine.
 
 ## Contract and compatibility
 
-The HTTP paths are purpose-built REST endpoints. They are not wire-compatible with the TanStack Start server functions that inspired the initial booking rules. Check [PARITY.md](PARITY.md) before migrating a client from that application.
+This module move preserves the HTTP method, path, request and response shape,
+status code, and OpenAPI contract. The API is not wire compatible with the
+original TanStack Start server functions. See [PARITY.md](PARITY.md) before
+migrating a client.

@@ -2,6 +2,14 @@
 
 A standalone Python/FastAPI backend for building a scheduling product. It has its own API and database, with WorkOS AuthKit for deployed host sign-in and optional Composio Google Calendar and Resend integrations. FastAPI publishes an OpenAPI document at `/openapi.json` and interactive API docs at `/docs`.
 
+The code is organized by feature under `app/features/`: hosts, profiles,
+availability, event types, bookings, calendars, contacts, onboarding,
+workflows, and notifications. `app/main.py` composes their routers;
+`app/core/` contains shared auth, database, and HTTP wiring. Start with
+[ARCHITECTURE.md](ARCHITECTURE.md) and
+[docs/FEATURE_ARCHITECTURE.md](docs/FEATURE_ARCHITECTURE.md) to add a feature
+or replace a provider.
+
 ## Run locally
 
 Python 3.11 or newer is required.
